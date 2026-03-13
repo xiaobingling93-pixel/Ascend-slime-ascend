@@ -17,6 +17,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.misc import load_function
+import slime_plugins.patch.mbridge_patch
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -33,7 +34,7 @@ class LinearForLastLayer(torch.nn.Linear):
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
             self.weight.sequence_parallel = True
-
+            self.bias.sequence_parallel = True
         self.weight.data.normal_(mean=0.0, std=0.02)
         if bias:
             self.bias.data.zero_()
@@ -55,6 +56,8 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+    AutoMapping.register_module_type('LinearForLastLayer', 'replicated')  # 或 'column' / 'replicated'
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -88,6 +91,68 @@ def get_model_provider_func(
         provider.expert_model_parallel_size = args.expert_model_parallel_size
         provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
         provider.sequence_parallel = args.sequence_parallel
+        provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        # Recompute settings - enable these if memory is insufficient
+        # provider.recompute_granularity = args.recompute_granularity
+        # provider.recompute_method = args.recompute_method
+        # provider.recompute_num_layers = args.recompute_num_layers
+        for key, value in vars(args).items():
+            if hasattr(provider, key):
+                continue
+            setattr(provider, key, value)
+
+        if role == 'critic':
+            from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+            from slime_plugins.patch.critic_patch import load_weights_hf_to_megatron_wrapper
+            _origin_load_weights_hf_to_megatron = MegatronModelBridge.load_weights_hf_to_megatron
+            MegatronModelBridge.load_weights_hf_to_megatron = load_weights_hf_to_megatron_wrapper
+
+            _original_provide = provider.provide
+
+            def provide_wrapper(pre_process=None, post_process=None, vp_stage=None):
+                """
+                Provide a Qwen3VL MoE model instance with vision and language components.
+                """
+                from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+                language_transformer_config = provider
+
+                # Create vision transformer config - placeholder for future use
+                hf_config = provider.vision_config
+
+                language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=provider.num_moe_experts,
+                    moe_grouped_gemm=True,
+                    qk_layernorm=provider.qk_layernorm,
+                    fp8=False,
+                    normalization="RMSNorm",
+                )
+
+                # reuse Qwen3VLModel for MoE model but replace the language model with MoE language model
+                model = Qwen3VLModel(
+                    language_transformer_config=language_transformer_config,
+                    language_transformer_layer_spec=language_transformer_layer_spec,
+                    vision_transformer_config=hf_config,
+                    pre_process=pre_process,
+                    post_process=post_process,
+                )
+
+                if role == "critic" and post_process:
+                    model.language_model.output_layer = LinearForLastLayer(input_size=provider.hidden_size, output_size=1, config=provider).to(
+                        device=model.language_model.output_layer.weight.device,
+                        dtype=model.language_model.output_layer.weight.dtype,
+                    )
+
+                # Apply freeze options if any are enabled for fine-tuning
+                if provider.freeze_language_model or provider.freeze_vision_model or provider.freeze_vision_projection:
+                    model.freeze(
+                        freeze_language_model=provider.freeze_language_model,
+                        freeze_vision_model=provider.freeze_vision_model,
+                        freeze_vision_projection=provider.freeze_vision_projection,
+                    )
+
+                return model
+            provider.provide = provide_wrapper
+            
         provider.finalize()
         return provider.provide
 
