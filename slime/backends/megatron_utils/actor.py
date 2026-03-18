@@ -8,10 +8,7 @@ from contextlib import nullcontext
 import ray
 import torch
 import torch.distributed as dist
-from slime.utils.common import is_npu
-if is_npu():
-    import mindspeed.megatron_adaptor
-    from mindspeed.megatron_adaptor import repatch
+
 from megatron.core import mpu
 from ray.actor import ActorHandle
 from torch_memory_saver import torch_memory_saver
@@ -28,6 +25,7 @@ from slime.utils.reloadable_process_group import destroy_process_groups, monkey_
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
+from slime.utils.common import is_npu
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
@@ -59,8 +57,6 @@ class MegatronTrainRayActor(TrainRayActor):
         super().init(args, role, with_ref)
 
         init(args)
-        if is_npu():
-            repatch(args)
 
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
