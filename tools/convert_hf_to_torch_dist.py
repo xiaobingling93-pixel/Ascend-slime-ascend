@@ -4,6 +4,10 @@ import shutil
 
 import torch
 import torch.distributed as dist
+from slime.utils.common import is_npu
+if is_npu():
+    import mindspeed.megatron_adaptor
+    from mindspeed.megatron_adaptor import repatch
 from megatron.core.enums import ModelType
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
@@ -15,10 +19,6 @@ from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
 from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import print_memory
-from slime.utils.common import is_npu
-if is_npu():
-    import mindspeed.megatron_adaptor
-
 
 def add_convertion_args(parser):
     """Add conversion arguments to the parser"""
@@ -118,6 +118,8 @@ def main():
         )
     args = get_args()
     init(args)
+    if is_npu():
+        repatch(args)
 
     # if using AMD gpus, we have to do the conversion in cpu
     if hasattr(torch.version, "hip") and torch.version.hip is not None:
