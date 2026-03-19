@@ -28,14 +28,13 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/glm4.7-30B-A3B.sh"
+source scripts/models/glm4.7-30B-A3B.sh
 
 CKPT_ARGS=(
    --hf-checkpoint /path/to/models/GLM-4.7-Flash
    --ref-load /path/to/models/GLM-4.7-Flash_torch_dist
-   --load /path/to/models/GLM-4.7-Flash_slime_0312/
-   --save /path/to/models/GLM-4.7-Flash_slime_0312/
+   --load /path/to/models/GLM-4.7-Flash/
+   --save /path/to/models/GLM-4.7-Flash/
    --save-interval 100
 )
 
@@ -51,7 +50,6 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt 8
    --rollout-max-response-len $((1024 * 4))
    --rollout-temperature 1
-
    --global-batch-size 64
    --balance-data
 )
@@ -115,20 +113,10 @@ SGLANG_ARGS=(
    --sglang-dp-size 8
    --sglang-enable-dp-lm-head
    --sglang-moe-dense-tp-size 1
-
-   # MTP speculative decoding (EAGLE) — speeds up inference
-   # Uncomment the following lines to enable:
-   # --sglang-speculative-algorithm EAGLE
-   # --sglang-speculative-num-steps 2
-   # --sglang-speculative-eagle-topk 1
-   # --sglang-speculative-num-draft-tokens 3
-
    --sglang-cuda-graph-max-bs 16
    --sglang-max-running-requests 64
-   
    # ======================= NPU 添加参数 =======================
    --sglang-device npu
-   # --sglang-log-level debug
 )
 
 MISC_ARGS=(
@@ -140,18 +128,9 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    # need to comment this when using model with MLA
    --attention-backend flash
-
    --moe-token-dispatcher-type alltoall
-   # --no-gradient-accumulation-fusion
 )
 
-# MTP training — uncomment to enable MTP layer training
-# Requires --mtp-num-layers in MODEL_ARGS (add to glm4.7-30B-A3B.sh or override below)
-# MODEL_ARGS+=(--mtp-num-layers 1)
-SPEC_ARGS=(
-   # --enable-mtp-training
-   # --mtp-loss-scaling-factor 0.2
-)
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
@@ -176,8 +155,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    --actor-num-gpus-per-node 8 \
    --rollout-num-gpus 8 \
    --num-gpus-per-node 8 \
-   # currently not support colocate mode
-   # --colocate \ 
    ${MODEL_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \

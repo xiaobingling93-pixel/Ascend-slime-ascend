@@ -1,3 +1,31 @@
+From 298fcb110e726fc043d3d9a437dc5a088ed9fde2 Mon Sep 17 00:00:00 2001
+From: Fei Mei <fei_mei_mf@qq.com>
+Date: Wed, 18 Mar 2026 21:54:55 +0800
+Subject: [PATCH] mindspeed fix
+
+---
+ mindspeed/core/fusions/fused_moe_permute.py                 | 4 ++--
+ mindspeed/core/fusions/fused_rope.py                        | 3 ++-
+ mindspeed/megatron_adaptor.py                               | 1 +
+ .../dot_product_attention/dot_product_attention.py          | 6 +++++-
+ 4 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/mindspeed/core/fusions/fused_moe_permute.py b/mindspeed/core/fusions/fused_moe_permute.py
+index bb007b44..98708a5b 100644
+--- a/mindspeed/core/fusions/fused_moe_permute.py
++++ b/mindspeed/core/fusions/fused_moe_permute.py
+@@ -100,9 +100,9 @@ def sort_chunks_by_idxs_wrapper(fn):
+ def moe_alltoall_token_dispatcher_init_wrapper(fn):
+     @wraps(fn)
+     def wrapper(
+-            self, num_local_experts, local_expert_indices, config, model_comm_pgs=None
++            self, num_local_experts, local_expert_indices, config, pg_collection=None
+     ) -> None:
+-        fn(self, num_local_experts, local_expert_indices, config, model_comm_pgs)
++        fn(self, num_local_experts, local_expert_indices, config, pg_collection)
+         # Since fused_sort_chunks_by_index is not currently supported, set self.permute_idx_device to None
+         self.permute_idx_device = None
+         input_chunk_idxs = torch.arange(
 diff --git a/mindspeed/core/fusions/fused_rope.py b/mindspeed/core/fusions/fused_rope.py
 index a6f02e07..70f7cb08 100644
 --- a/mindspeed/core/fusions/fused_rope.py
@@ -46,3 +74,6 @@ index ac4eabe5..78c5866d 100644
          packed_seq_kwargs = (
              {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
              if packed_seq_params is not None
+-- 
+2.28.0.windows.1
+
