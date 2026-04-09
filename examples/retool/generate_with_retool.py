@@ -1,4 +1,5 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
+import random
 import re
 from typing import Any
 
@@ -19,6 +20,19 @@ except ImportError as e:
 
 # Import tool sandbox functionality
 from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
+
+# ── Sample-level verbose logging ──────────────────────────────────────────
+# Roughly 1/20 samples are logged so the output stays readable.
+_LOG_SAMPLE_PROB = 0.05
+_LOG_WIDTH = 300
+
+
+def _trunc(s: str, n: int = 300) -> str:
+    """Truncate *s* to at most *n* characters for display."""
+    if len(s) <= n:
+        return s
+    return s[:n] + f"…[+{len(s) - n}]"
+
 
 # Jinja2 template for tool-enabled conversations
 TOOL_TEMPLATE = """<|im_start|>system
@@ -127,6 +141,22 @@ def postprocess_predictions(prediction: str):
         except (json.JSONDecodeError, KeyError, AttributeError):
             pass
 
+    # Check for GLM4.7-native tool call format:
+    # <tool_call>funcname<arg_key>argname</arg_key><arg_value>raw_python_code</arg_value></tool_call>
+    # The argument value is raw code, NOT JSON.
+    glm_tool_call_pattern = (
+        r"<tool_call>\s*(\w[\w.]*)\s*"
+        r"(?:<arg_key>[^<]*</arg_key>)?\s*"
+        r"<arg_value>(.*?)</arg_value>\s*"
+        r"</tool_call>"
+    )
+    glm_match = re.search(glm_tool_call_pattern, prediction, re.DOTALL)
+    if glm_match:
+        tool_name = glm_match.group(1).strip()
+        code = glm_match.group(2).strip()
+        if tool_name == "code_interpreter" and code:
+            return "code", code
+
     # Then check for <code> tags
     code_pattern = r"<code>(.*?)</code>"
     code_match = re.search(code_pattern, prediction, re.DOTALL)
@@ -146,14 +176,25 @@ def postprocess_predictions(prediction: str):
 
 def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
-    # Handle <tool_call> tags (new format from Jinja2 template)
+    # Handle <tool_call> tags (Qwen and GLM4.7 formats)
     if "<tool_call>" in resp:
-        # Find the last occurrence of <tool_call>...</tool_call>
+        # Try Qwen-style JSON format: <tool_call>{"name": ..., "arguments": {...}}</tool_call>
         tool_call_pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
         matches = list(re.finditer(tool_call_pattern, resp, re.DOTALL))
         if matches:
             last_match = matches[-1]
             return resp[: last_match.end()]
+        # Try GLM4.7-native format:
+        # <tool_call>funcname<arg_key>argname</arg_key><arg_value>code</arg_value></tool_call>
+        glm_tool_call_pattern = (
+            r"<tool_call>\s*\w[\w.]*\s*"
+            r"(?:<arg_key>[^<]*</arg_key>)?\s*"
+            r"<arg_value>.*?</arg_value>\s*"
+            r"</tool_call>"
+        )
+        glm_matches = list(re.finditer(glm_tool_call_pattern, resp, re.DOTALL))
+        if glm_matches:
+            return resp[: glm_matches[-1].end()]
 
     # Handle <code> tags
     if "</code>" in resp:
@@ -180,9 +221,15 @@ def postprocess_responses(resp: str) -> str:
     return resp
 
 
+def _uses_glm_tool_format(prediction: str) -> bool:
+    """Detect GLM4.7-native tool call format by presence of </arg_value>."""
+    return "</arg_value>" in prediction
+
+
 async def execute_predictions(prediction: str) -> str:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
+    glm_format = _uses_glm_tool_format(prediction)
 
     if action == "code":
         # Content is already the Python code (extracted by
@@ -191,10 +238,18 @@ async def execute_predictions(prediction: str) -> str:
         if code:
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("code_interpreter", {"code": code})
-            next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
+            if glm_format:
+                # GLM4.7: model generates <|observation|> as stop token before
+                # halting; append result and signal the next assistant turn.
+                next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n<|assistant|>\n"
+            else:
+                next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
             done = False
         else:
-            next_obs = "\n\n<interpreter>\nError: No Python code found" "\n</interpreter>\n\n"
+            if glm_format:
+                next_obs = "\n\n<interpreter>\nError: No Python code found\n</interpreter>\n<|assistant|>\n"
+            else:
+                next_obs = "\n\n<interpreter>\nError: No Python code found\n</interpreter>\n\n"
             done = False
     elif action == "answer":
         next_obs = ""
@@ -221,30 +276,86 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
-    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+    # Use the tokenizer's own chat template so tool call instructions match the
+    # model's native format (e.g. GLM4.7 vs Qwen).  Fall back to the Qwen-style
+    # TOOL_TEMPLATE for tokenizers that do not support the tools= parameter.
+    #
+    # sample.prompt may be a plain string or a list of message dicts depending
+    # on whether --apply-chat-template was set and how the dataset stores prompts.
+    if isinstance(sample.prompt, list):
+        messages = sample.prompt
+    else:
+        messages = [{"role": "user", "content": sample.prompt}]
+    try:
+        prompt = state.tokenizer.apply_chat_template(
+            messages,
+            tools=tool_specs,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        # Fallback: extract raw text from the last user turn if needed.
+        if isinstance(sample.prompt, list):
+            raw_prompt = next(
+                (m["content"] for m in reversed(sample.prompt) if m.get("role") == "user"),
+                "",
+            )
+        else:
+            raw_prompt = sample.prompt
+        prompt = format_conversation_with_tools(prompt=raw_prompt, tools=tool_specs)
 
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
     response = ""
     response_token_ids = []
     loss_masks = []
     tool_call_count = 0  # Track actual tool call rounds
+    obs_truncated = False  # Flag: obs caused total length to exceed max_context_length
+    # Calculate max context length once at the beginning
+    max_context_length = len(prompt_tokens_ids) + args.rollout_max_response_len
+    print(f"max_context_length is set to {max_context_length}", flush=True)
+
+    # Randomly select a small fraction of samples for detailed turn-by-turn logging.
+    verbose = random.random() < _LOG_SAMPLE_PROB
+    if verbose:
+        _sep = "═" * _LOG_WIDTH
+        print(f"\n{_sep}", flush=True)
+        _prompt_display = (
+            "".join(m.get("content", "") for m in sample.prompt)
+            if isinstance(sample.prompt, list)
+            else sample.prompt
+        )
+        print(f"[ReTool LOG] prompt ({len(prompt_tokens_ids)} tokens): {_trunc(_prompt_display, 200)}", flush=True)
+        print(_sep, flush=True)
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
+        # Use token IDs instead of text
+        current_token_ids = prompt_tokens_ids + response_token_ids
+
         # Check if total length exceeds max context length
-        total_length = len(prompt_tokens_ids) + len(response_token_ids)
-        if args.rollout_max_context_len is not None:
-            max_context_length = args.rollout_max_context_len
-        else:
-            max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
+        total_length = len(current_token_ids)
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
             break
 
-        # Use token IDs instead of text
-        current_token_ids = prompt_tokens_ids + response_token_ids
+        # Dynamically calculate remaining token budget for this turn
+        remaining_tokens = max_context_length - total_length
+
+        # Update max_new_tokens for this turn to respect the remaining budget
+        # Make a copy to avoid modifying the original sampling_params
+        current_sampling_params = sampling_params.copy()
+        current_sampling_params["max_new_tokens"] = min(
+            sampling_params.get("max_new_tokens", args.rollout_max_response_len),
+            remaining_tokens
+        )
+
+        # Check if we have budget for more tokens
+        if current_sampling_params["max_new_tokens"] <= 0:
+            sample.status = Sample.Status.TRUNCATED
+            break
+
         payload = {
             "input_ids": current_token_ids,
-            "sampling_params": sampling_params,
+            "sampling_params": current_sampling_params,
             "return_logprob": True,  # Request log probabilities for training
         }
 
@@ -293,11 +404,33 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response_token_ids += cur_response_token_ids
         loss_masks += [1] * len(cur_response_token_ids)
 
+        # verbose: show what the model generated this turn
+        if verbose:
+            n_tok = len(cur_response_token_ids)
+            finish = output["meta_info"]["finish_reason"]["type"]
+            print(f"\n{'─' * _LOG_WIDTH}", flush=True)
+            print(f"[Turn {turn + 1}] model output ({n_tok} tok, finish={finish}):", flush=True)
+            print("  " + _trunc(cur_response).replace("\n", "\n  "), flush=True)
+
         # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
+            if verbose:
+                print(f"[Turn {turn + 1}] → length limit reached, stopping.", flush=True)
             break
 
         next_obs, done = await execute_predictions(cur_response)
+
+        # verbose: show action and observation
+        if verbose:
+            if done:
+                print(f"[Turn {turn + 1}] → answer detected (DONE)", flush=True)
+            elif "<interpreter>" in next_obs:
+                obs_display = "  " + _trunc(next_obs, 300).replace("\n", "\n  ")
+                print(f"[Turn {turn + 1}] → code executed, observation:", flush=True)
+                print(obs_display, flush=True)
+            else:
+                print(f"[Turn {turn + 1}] → invalid action (no recognized code or answer)", flush=True)
+
         if done:
             break
 
@@ -321,8 +454,28 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 sample.rollout_log_probs
             ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
 
+        # Truncate if obs pushed total response tokens beyond max_context_length
+        max_response_tokens = max_context_length - len(prompt_tokens_ids)
+        if len(response_token_ids) > max_response_tokens:
+            response_token_ids = response_token_ids[:max_response_tokens]
+            loss_masks = loss_masks[:max_response_tokens]
+            if sample.rollout_log_probs is not None:
+                sample.rollout_log_probs = sample.rollout_log_probs[:max_response_tokens]
+            obs_truncated = True
+            break
+
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
             break
+
+    if verbose:
+        print(f"\n{'═' * _LOG_WIDTH}", flush=True)
+        print(
+            f"[ReTool LOG] finished | tool_calls={tool_call_count} | "
+            f"response_tokens={len(response_token_ids)} | "
+            f"finish={output['meta_info']['finish_reason']['type']}",
+            flush=True,
+        )
+        print("═" * _LOG_WIDTH + "\n", flush=True)
 
     # Set sample attributes
     sample.tokens = prompt_tokens_ids + response_token_ids
@@ -347,6 +500,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         case "stop":
             sample.status = Sample.Status.COMPLETED
 
+    if obs_truncated:
+        sample.status = Sample.Status.TRUNCATED
+
     return sample
 
 
@@ -355,8 +511,13 @@ async def reward_func(args, sample, **kwargs):
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 
-    # Build complete solution string
-    solution_str = sample.prompt + sample.response
+    # Build complete solution string.
+    # sample.prompt may be a list of message dicts; flatten to plain text.
+    if isinstance(sample.prompt, list):
+        prompt_str = "".join(m.get("content", "") for m in sample.prompt)
+    else:
+        prompt_str = sample.prompt
+    solution_str = prompt_str + sample.response
 
     # Get ground truth answer - label is a string, not a dict
     ground_truth = sample.label if sample.label is not None else ""
