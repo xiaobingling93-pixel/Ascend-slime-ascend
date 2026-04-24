@@ -92,6 +92,8 @@ def get_batch(
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
             qkv_format="thd",
         )
 
