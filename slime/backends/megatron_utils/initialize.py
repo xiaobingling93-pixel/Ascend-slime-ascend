@@ -55,6 +55,13 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 def init(args):
     set_args(args)
+
+    from slime.utils.common import is_npu
+    if is_npu():
+        import mindspeed.megatron_adaptor
+        from mindspeed.megatron_adaptor import repatch
+        repatch(args)
+
     if args.enable_experimental:
         logger.info("Enable megatron experimental")
         set_experimental_flag(True)
